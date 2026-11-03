@@ -1,0 +1,75 @@
+menu "ADS-B Display"
+
+    menu "Defaults (can be changed on the device in Settings)"
+        config ADSB_WIFI_SSID
+            string "Wi-Fi SSID"
+            default ""
+
+        config ADSB_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default ""
+
+        config ADSB_SERVER_HOST
+            string "ADS-B server host/IP"
+            default ""
+            help
+                Host running dump1090 / readsb / dump1090-fa / piaware etc.
+
+        choice ADSB_PROTOCOL
+            prompt "Feed protocol"
+            default ADSB_PROTOCOL_BEAST
+            help
+                Beast binary (port 30005) carries the most information: every raw Mode S
+                frame plus signal level. Raw AVR (30002) carries raw frames as hex text.
+                SBS/BaseStation (30003) is pre-decoded CSV and has less detail.
+
+            config ADSB_PROTOCOL_BEAST
+                bool "Beast binary (30005)"
+            config ADSB_PROTOCOL_AVR
+                bool "Raw AVR hex (30002)"
+            config ADSB_PROTOCOL_SBS
+                bool "SBS-1 BaseStation CSV (30003)"
+        endchoice
+
+        config ADSB_SERVER_PORT
+            int "ADS-B server port"
+            default 30005 if ADSB_PROTOCOL_BEAST
+            default 30002 if ADSB_PROTOCOL_AVR
+            default 30003 if ADSB_PROTOCOL_SBS
+
+        config ADSB_RX_LAT
+            string "Receiver latitude (decimal degrees)"
+            default "0.0"
+            help
+                Used for range rings, distance/bearing and local CPR decoding.
+
+        config ADSB_RX_LON
+            string "Receiver longitude (decimal degrees)"
+            default "0.0"
+
+        config ADSB_DEFAULT_TZ
+            int "Default timezone (index into the Settings list; 0 = UTC)"
+            default 0
+            range 0 17
+
+        config ADSB_ONLINE_LOOKUP
+            bool "Look up registration/type/operator/route online (api.adsbdb.com)"
+            default y
+    endmenu
+
+    menu "Board orientation"
+        config ADSB_LCD_MIRROR_X
+            bool "Mirror LCD X"
+            default y
+        config ADSB_LCD_MIRROR_Y
+            bool "Mirror LCD Y"
+            default y
+        config ADSB_TOUCH_MIRROR_X
+            bool "Mirror touch X"
+            default n
+        config ADSB_TOUCH_MIRROR_Y
+            bool "Mirror touch Y"
+            default y
+    endmenu
+
+endmenu

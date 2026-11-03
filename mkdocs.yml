@@ -1,0 +1,54 @@
+site_name: ESP32-P4 ADS-B Display
+site_url: https://optimusprimeums.github.io/esp32p4-adsb-display/
+site_description: Standalone ADS-B radar display firmware for the Guition JC8012P4A1 (ESP32-P4 + ESP32-C6, 10.1" touch)
+repo_url: https://github.com/Optimusprimeums/esp32p4-adsb-display
+repo_name: esp32p4-adsb-display
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: indigo
+      accent: light blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: indigo
+      accent: light blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Hardware: hardware.md
+      - Build and flash: getting-started.md
+      - Connecting a feed: feeds.md
+  - Using the display:
+      - Screens: using.md
+      - Settings reference: settings.md
+      - Offline map: offline-map.md
+  - Maintenance:
+      - Firmware updates (OTA): ota.md
+      - Wi-Fi co-processor (C6): coprocessor.md
+      - Troubleshooting: troubleshooting.md
+  - Internals:
+      - What is decoded: decoding.md
+      - Architecture: development.md
+  - Credits and licences: credits.md

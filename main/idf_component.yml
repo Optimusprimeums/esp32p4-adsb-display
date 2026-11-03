@@ -1,0 +1,8 @@
+dependencies:
+  idf: ">=6.0"
+  lvgl/lvgl: "~9.5.0"
+  espressif/esp_lcd_jd9365: "2.0.2"
+  espressif/esp_lcd_touch: "~1.1.2"
+  espressif/esp_hosted: "^3.0.9"
+  espressif/esp_wifi_remote: "^1.6.5"
+  espressif/cjson: "^1.7.19"

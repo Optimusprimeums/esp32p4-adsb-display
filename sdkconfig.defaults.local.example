@@ -1,0 +1,9 @@
+# Copy to sdkconfig.defaults.local (ignored by git) to set your own build-time
+# defaults. Everything here can also be changed on the device in Settings.
+#CONFIG_ADSB_WIFI_SSID="my-network"
+#CONFIG_ADSB_WIFI_PASSWORD="my-password"
+#CONFIG_ADSB_SERVER_HOST="192.168.1.50"
+#CONFIG_ADSB_RX_LAT="51.4700"
+#CONFIG_ADSB_RX_LON="-0.4543"
+#CONFIG_ADSB_DEFAULT_TZ=9
+#CONFIG_LWIP_LOCAL_HOSTNAME="adsb-display"

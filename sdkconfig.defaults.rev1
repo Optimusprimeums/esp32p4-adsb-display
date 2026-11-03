@@ -1,0 +1,4 @@
+# Overlay for boards with ESP32-P4 silicon rev v1.x
+# Usage: idf.py -B build_rev1 -D SDKCONFIG=build_rev1/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.rev1" build
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
