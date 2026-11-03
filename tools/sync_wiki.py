@@ -73,7 +73,8 @@ def main():
                  % (cfg.get('site_url', ''), name))
         with open(os.path.join(wiki, page_name(name) + '.md'), 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
-    side = ['**[%s](Home)**' % cfg['site_name'], '']
+    side = ['**[%s](Home)**' % cfg['site_name'], '',
+            ':book: **[Documentation site](%s)**' % cfg.get('site_url', ''), '']
     for title, target in nav_items(cfg['nav']):
         if target is None:
             side += ['', '**%s**' % title]
