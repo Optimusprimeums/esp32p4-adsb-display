@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "sdkconfig.h"
 #include "settings.h"
 #include "wifi.h"
 
@@ -38,6 +39,10 @@ const char *feed_state_str(feed_state_t s)
 void adsb_client_status(feed_status_t *out)
 {
     *out = s_status;
+#if CONFIG_ADSB_DEMO
+    out->state = FEED_CONNECTED;
+    strlcpy(out->detail, "192.168.1.50:30005 (Beast)", sizeof(out->detail));
+#endif
 }
 
 void adsb_client_restart(void)

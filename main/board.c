@@ -55,7 +55,9 @@ static const char *TAG = "board";
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 static esp_lcd_touch_handle_t s_touch;
+static i2c_master_bus_handle_t s_i2c_bus;
 static SemaphoreHandle_t s_vsync_sem;
+static const void *volatile s_front_fb;
 
 /* ------------------------------------------------------------------------- */
 /* Backlight                                                                 */
@@ -248,6 +250,7 @@ static void touch_init(void)
         .flags.enable_internal_pullup = true,
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+    s_i2c_bus = bus;
 
     esp_lcd_panel_io_handle_t tp_io;
     esp_lcd_panel_io_i2c_config_t io_cfg = ESP_LCD_TOUCH_IO_I2C_GSL3680_CONFIG();
@@ -295,8 +298,14 @@ static void lv_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_m
         xSemaphoreTake(s_vsync_sem, 0);
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0, BOARD_LCD_H_RES, BOARD_LCD_V_RES, px_map);
         xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(50));
+        s_front_fb = px_map;
     }
     lv_display_flush_ready(disp);
+}
+
+const void *board_front_buffer(void)
+{
+    return s_front_fb;
 }
 
 static void lv_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
@@ -356,4 +365,9 @@ lv_display_t *board_init(void)
     lv_indev_set_display(indev, disp);
 
     return disp;
+}
+
+i2c_master_bus_handle_t board_i2c_bus(void)
+{
+    return s_i2c_bus;
 }

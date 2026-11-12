@@ -61,6 +61,9 @@ typedef struct {
 void ota_init(void);
 /* Start the web server (after networking is initialised). */
 void ota_start_server(void);
+/* Register an extra handler on the update web server (demo screenshots) */
+struct httpd_uri;
+void ota_register_uri(const struct httpd_uri *uri);
 
 /* Inputs to the boot verification */
 void ota_report_selftest(bool passed);

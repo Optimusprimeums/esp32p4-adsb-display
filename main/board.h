@@ -35,3 +35,10 @@ void board_set_flip(bool flipped);
 void board_screen_off(void);
 void board_screen_wake(void);
 bool board_screen_is_off(void);
+
+/* The frame buffer currently being scanned out (RGB565, BOARD_LCD_H_RES x V_RES) */
+const void *board_front_buffer(void);
+
+/* The I2C bus shared by touch and the ES8311 audio codec (valid after board_init) */
+#include "driver/i2c_master.h"
+i2c_master_bus_handle_t board_i2c_bus(void);

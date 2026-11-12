@@ -18,11 +18,16 @@ GPL-3.0-or-later licence.
 
 ## Libraries fetched at build time
 
-ESP-IDF, LVGL, ESP-Hosted, esp_wifi_remote, esp_lcd_jd9365, esp_lcd_touch and
-cJSON are downloaded by the ESP-IDF component manager under their own licences
+ESP-IDF, LVGL, ESP-Hosted, esp_wifi_remote, esp_lcd_jd9365, esp_lcd_touch,
+cJSON and esp_codec_dev are downloaded by the ESP-IDF component manager under
+their own licences
 (Apache-2.0 / MIT).
 
 ## Map and lookup data
+
+- Weather radar (weather view build only): [RainViewer](https://www.rainviewer.com/)
+  public API. The display credits RainViewer on screen whenever the radar
+  layer is shown.
 
 - Coastlines: [Natural Earth](https://www.naturalearthdata.com/) (public domain)
   or [OpenStreetMap](https://www.openstreetmap.org/copyright) © OpenStreetMap

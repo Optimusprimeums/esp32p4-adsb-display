@@ -1,0 +1,3 @@
+# Weather view build: full-screen ADS-B and weather views, RainViewer radar on the map.
+# idf.py -B build_wx -D ADSB_VARIANT=wx -D SDKCONFIG=build_wx/sdkconfig build
+CONFIG_ADSB_WX_VIEW=y

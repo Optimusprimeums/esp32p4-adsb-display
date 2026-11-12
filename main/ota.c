@@ -1,3 +1,5 @@
+#include "crashlog.h"
+#include "esp_heap_caps.h"
 #include "ota.h"
 
 #include <stdarg.h>
@@ -196,10 +198,13 @@ static esp_err_t status_get(httpd_req_t *req)
 {
     ota_status_t st;
     ota_get_status(&st);
-    char buf[256];
+    char buf[640];
     snprintf(buf, sizeof(buf), "{\"version\":\"%s\",\"partition\":\"%s\",\"prev\":\"%s\",\"armed\":%lu,"
-             "\"pending_verify\":%s}", st.version, st.partition, st.prev_version,
-             (unsigned long)st.armed_left_s, st.pending_verify ? "true" : "false");
+             "\"pending_verify\":%s,\"last_crash\":\"%s\",\"heap_int\":%u,\"heap_psram\":%u,\"heap_int_min\":%u}",
+             st.version, st.partition, st.prev_version,
+             (unsigned long)st.armed_left_s, st.pending_verify ? "true" : "false", crashlog_text(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
@@ -347,6 +352,11 @@ static esp_err_t update_post(httpd_req_t *req)
                             "It confirms itself once Wi-Fi is up; if it fails it returns to the previous version.");
     xTaskCreate(reboot_task, "ota_reboot", 2048, NULL, 5, NULL);
     return ESP_OK;
+}
+
+void ota_register_uri(const struct httpd_uri *uri)
+{
+    if (s_httpd) httpd_register_uri_handler(s_httpd, uri);
 }
 
 void ota_start_server(void)

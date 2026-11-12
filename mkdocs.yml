@@ -44,6 +44,8 @@ nav:
       - Screens: using.md
       - Settings reference: settings.md
       - Offline map: offline-map.md
+      - Airband audio: airband.md
+      - Weather view build: weather-view.md
   - Maintenance:
       - Firmware updates (OTA): ota.md
       - Wi-Fi co-processor (C6): coprocessor.md

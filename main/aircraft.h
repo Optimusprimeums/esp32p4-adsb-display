@@ -169,3 +169,7 @@ void aircraft_tick(void);
 void aircraft_feed_event(bool connected);
 
 uint32_t now_ms(void);
+
+/* Demo mode helpers */
+void aircraft_remove(uint32_t addr);
+void aircraft_count_messages(uint32_t n, float rate);

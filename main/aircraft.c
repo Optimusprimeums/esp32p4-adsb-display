@@ -456,6 +456,31 @@ void aircraft_tick(void)
     aircraft_unlock();
 }
 
+void aircraft_remove(uint32_t addr)
+{
+    aircraft_lock();
+    aircraft_t *a = aircraft_find(addr);
+    if (a) a->used = false;
+    aircraft_unlock();
+}
+
+/* lets the demo simulator show a realistic message rate in the stats */
+void aircraft_count_messages(uint32_t n, float rate)
+{
+    aircraft_lock();
+    s_stats.msgs_total += n;
+    s_stats.msgs_good += n;
+    s_stats.df_count[17] += n * 6 / 10;
+    s_stats.df_count[11] += n / 10;
+    s_stats.df_count[20] += n / 10;
+    s_stats.df_count[21] += n / 10;
+    s_stats.df_count[4] += n / 20;
+    s_stats.df_count[5] += n / 20;
+    s_rate_msgs += n;
+    (void)rate;
+    aircraft_unlock();
+}
+
 void aircraft_feed_event(bool connected)
 {
     aircraft_lock();

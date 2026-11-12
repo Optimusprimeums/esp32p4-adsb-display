@@ -92,6 +92,18 @@ static void load_defaults(app_settings_t *c)
     c->flip = false;
     c->saver = true;
     c->saver_min = 10;
+    strlcpy(c->wx_host, CONFIG_ADSB_WX_HOST, sizeof(c->wx_host));
+    c->wx_port = CONFIG_ADSB_WX_PORT;
+    c->wx_units = (wx_units_t)CONFIG_ADSB_WX_UNITS;
+    strlcpy(c->ab_host, CONFIG_ADSB_AB_HOST, sizeof(c->ab_host));
+    c->ab_port = CONFIG_ADSB_AB_PORT;
+    c->ab_listen = false;
+    c->ab_volume = 70;
+    c->ab_mute = false;
+    c->ab_filter[0] = 0;
+    c->ab_token[0] = 0;
+    strlcpy(c->ab_presets, CONFIG_ADSB_AB_PRESETS, sizeof(c->ab_presets));
+    c->ab_guard[0] = 0;
 }
 
 void settings_init(void)
@@ -122,6 +134,28 @@ void settings_init(void)
     if (nvs_get_u8(h, "saver", &u8) == ESP_OK) s_cfg.saver = u8 != 0;
     uint16_t u16;
     if (nvs_get_u16(h, "saver_min", &u16) == ESP_OK && u16 >= 1 && u16 <= 1440) s_cfg.saver_min = u16;
+    len = sizeof(s_cfg.wx_host); nvs_get_str(h, "wx_host", s_cfg.wx_host, &len);
+    nvs_get_u16(h, "wx_port", &s_cfg.wx_port);
+    if (nvs_get_u8(h, "wx_units", &u8) == ESP_OK && u8 <= WX_UNITS_MARINE) s_cfg.wx_units = (wx_units_t)u8;
+    len = sizeof(s_cfg.ab_host); nvs_get_str(h, "ab_host", s_cfg.ab_host, &len);
+    nvs_get_u16(h, "ab_port", &s_cfg.ab_port);
+    if (nvs_get_u8(h, "ab_listen", &u8) == ESP_OK) s_cfg.ab_listen = u8 != 0;
+    if (nvs_get_u8(h, "ab_vol", &u8) == ESP_OK && u8 <= 100) s_cfg.ab_volume = u8;
+    if (nvs_get_u8(h, "ab_mute", &u8) == ESP_OK) s_cfg.ab_mute = u8 != 0;
+    len = sizeof(s_cfg.ab_filter); nvs_get_str(h, "ab_filter", s_cfg.ab_filter, &len);
+    len = sizeof(s_cfg.ab_token);  nvs_get_str(h, "ab_token", s_cfg.ab_token, &len);
+    {
+        /* Presets follow the build default until they are edited on the device: "ab_pdef" is the
+           default that was current when they were saved. Missing (older firmware) counts as unedited. */
+        char stored[sizeof(s_cfg.ab_presets)], pdef[sizeof(s_cfg.ab_presets)];
+        len = sizeof(stored);
+        if (nvs_get_str(h, "ab_presets", stored, &len) == ESP_OK) {
+            len = sizeof(pdef);
+            bool edited = nvs_get_str(h, "ab_pdef", pdef, &len) == ESP_OK && strcmp(stored, pdef) != 0;
+            if (edited) strlcpy(s_cfg.ab_presets, stored, sizeof(s_cfg.ab_presets));
+        }
+    }
+    len = sizeof(s_cfg.ab_guard); nvs_get_str(h, "ab_guard", s_cfg.ab_guard, &len);
 
     /* doubles are stored as raw 64-bit blobs */
     int64_t raw;
@@ -170,6 +204,19 @@ void settings_save(void)
     nvs_set_u8(h, "flip", s_cfg.flip ? 1 : 0);
     nvs_set_u8(h, "saver", s_cfg.saver ? 1 : 0);
     nvs_set_u16(h, "saver_min", s_cfg.saver_min);
+    nvs_set_str(h, "wx_host", s_cfg.wx_host);
+    nvs_set_u16(h, "wx_port", s_cfg.wx_port);
+    nvs_set_u8(h, "wx_units", (uint8_t)s_cfg.wx_units);
+    nvs_set_str(h, "ab_host", s_cfg.ab_host);
+    nvs_set_u16(h, "ab_port", s_cfg.ab_port);
+    nvs_set_u8(h, "ab_listen", s_cfg.ab_listen ? 1 : 0);
+    nvs_set_u8(h, "ab_vol", s_cfg.ab_volume);
+    nvs_set_u8(h, "ab_mute", s_cfg.ab_mute ? 1 : 0);
+    nvs_set_str(h, "ab_filter", s_cfg.ab_filter);
+    nvs_set_str(h, "ab_token", s_cfg.ab_token);
+    nvs_set_str(h, "ab_presets", s_cfg.ab_presets);
+    nvs_set_str(h, "ab_pdef", CONFIG_ADSB_AB_PRESETS);
+    nvs_set_str(h, "ab_guard", s_cfg.ab_guard);
     int64_t raw;
     memcpy(&raw, &s_cfg.rx_lat, sizeof(raw)); nvs_set_i64(h, "lat", raw);
     memcpy(&raw, &s_cfg.rx_lon, sizeof(raw)); nvs_set_i64(h, "lon", raw);

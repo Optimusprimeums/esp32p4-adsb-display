@@ -120,6 +120,8 @@ def main():
     ap.add_argument('--radius', type=float, default=400, help='nm')
     ap.add_argument('--tol', type=float, default=0.0003, help='simplify tolerance, degrees')
     ap.add_argument('--data', required=True)
+    ap.add_argument('--max-kind', type=int, default=2,
+                    help='0 = large airports only, 1 = + medium, 2 = + small airfields (default)')
     ap.add_argument('--osm-coast', help='Overpass JSON of natural=coastline ways (replaces Natural Earth)')
     ap.add_argument('--out', default=os.path.join(os.path.dirname(__file__), '..', 'main', 'map_data.c'))
     a = ap.parse_args()
@@ -148,7 +150,7 @@ def main():
     with open(os.path.join(a.data, 'airports.csv'), encoding='utf-8') as f:
         for r in csv.DictReader(f):
             k = kinds.get(r['type'])
-            if k is None:
+            if k is None or k > a.max_kind:
                 continue
             lat, lon = float(r['latitude_deg']), float(r['longitude_deg'])
             if dist_nm(a.lat, a.lon, lat, lon) > a.radius:

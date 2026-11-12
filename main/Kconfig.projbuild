@@ -52,10 +52,67 @@ menu "ADS-B Display"
             default 0
             range 0 17
 
+        config ADSB_WX_HOST
+            string "Weather: feed host/IP, RF controller or rtl_433 (empty = off)"
+            default ""
+            help
+                Where the weather readings come from. Either an RF controller's
+                weather feed (raw TCP, newline-delimited JSON, port 30090), or
+                a machine running rtl_433 with "-F http", e.g.
+                rtl_433 -f 915M -R 263 -F http:0.0.0.0:8433
+                The display tells the two apart by itself.
+
+        config ADSB_WX_PORT
+            int "Weather: feed port (RF controller 30090, rtl_433 8433)"
+            default 8433
+
+        config ADSB_WX_UNITS
+            int "Weather units (0 = C/km/h/mm, 1 = F/mph/in, 2 = C/kt/mm)"
+            default 0
+            range 0 2
+
+        config ADSB_AB_HOST
+            string "Airband: GopherTrunk HTTP API host/IP (empty = off)"
+            default ""
+            help
+                Machine running GopherTrunk with its HTTP API reachable on the LAN
+                (api.http_addr: "0.0.0.0:8080"). The Airband tab plays
+                /api/v1/audio/stream and lists calls from /api/v1/events.
+
+        config ADSB_AB_PORT
+            int "Airband: GopherTrunk HTTP API port"
+            default 8080
+
+        config ADSB_AB_PRESETS
+            string "Airband: tuning presets (Label MHz; Label MHz)"
+            default "Guard 121.500"
+            help
+                Buttons on the Airband tab that tune GopherTrunk, e.g.
+                "Tower 118.700; Ground 121.900; ATIS 127.250". Editable in Settings.
+
         config ADSB_ONLINE_LOOKUP
             bool "Look up registration/type/operator/route online (api.adsbdb.com)"
             default y
     endmenu
+
+    config ADSB_DEMO
+        bool "Demo mode (simulated traffic around London Heathrow, for screenshots)"
+        default n
+        help
+            Replaces the network feed with simulated aircraft around EGLL, shows
+            placeholder network details, never saves settings, and adds
+            GET /screenshot.bmp to the update web server. Build with
+            sdkconfig.defaults.demo.
+
+    config ADSB_WX_VIEW
+        bool "Weather view build (full-screen ADS-B and weather views, radar on the map)"
+        default n
+        select LV_USE_LODEPNG
+        help
+            Adds a second full-screen view, switched from the top bar: the map
+            with RainViewer weather radar over it, and the weather station
+            below. Needs internet access for the radar. Build with
+            -D ADSB_VARIANT=wx (sdkconfig.defaults.wx).
 
     menu "Board orientation"
         config ADSB_LCD_MIRROR_X

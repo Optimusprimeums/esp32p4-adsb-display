@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include "adsb_client.h"
+#include "airband.h"
 #include "aircraft.h"
 #include "board.h"
 #include "esp_app_desc.h"
@@ -16,6 +17,10 @@
 #include "map_data.h"
 #include "ota.h"
 #include "settings.h"
+#include "weather.h"
+#if CONFIG_ADSB_WX_VIEW
+#include "radar.h"
+#endif
 #include "src/misc/cache/instance/lv_image_cache.h"
 #include "wifi.h"
 
@@ -97,7 +102,22 @@ static int s_rows;
 #define RATE_HIST 120
 
 /* widgets */
-static lv_obj_t *s_radar, *s_range_lbl, *s_center_lbl;
+static lv_obj_t *s_radar, *s_range_lbl, *s_center_lbl, *s_radar_wind;
+static wx_state_t *s_wx_view;       /* PSRAM copy of the weather state, for drawing */
+#if CONFIG_ADSB_WX_VIEW
+/* weather view build: two full-screen views sharing the map */
+enum { VIEW_ADSB = 0, VIEW_WX };
+static int s_view = VIEW_ADSB;
+static lv_obj_t *s_wx_panel, *s_view_btn, *s_radar_btn, *s_radar_lbl;
+static bool s_show_radar;
+static const lv_image_dsc_t *s_radar_img;
+static radar_view_t s_radar_img_view;
+#endif
+static ab_state_t *s_ab_view;       /* PSRAM copy of the airband state */
+static lv_obj_t *s_ta_wx_host, *s_ta_wx_port, *s_dd_wx_units, *s_ta_ab_host, *s_ta_ab_port;
+
+/* bottom tabs */
+enum { TAB_LIST = 0, TAB_DETAILS, TAB_WEATHER, TAB_AIRBAND, TAB_STATS, TAB_SETTINGS, TAB_COUNT };
 static lv_obj_t *s_top_wifi, *s_top_feed, *s_top_count, *s_top_clock, *s_top_utc;
 static lv_obj_t *s_banner, *s_banner_lbl;
 static lv_obj_t *s_tabview;
@@ -494,6 +514,19 @@ static void radar_draw_cb(lv_event_t *e)
     if (cfg->rx_pos_valid && s_center_valid) project(cfg->rx_lat, cfg->rx_lon, &c, &rx, &ry);
 
     if (s_center_valid && s_show_map) draw_map(layer, &c);
+#if CONFIG_ADSB_WX_VIEW
+    /* radar image; while the map is dragged, the last image moves with it until the new one is ready */
+    if (s_center_valid && s_show_radar && s_radar_img && s_radar_img_view.px_per_nm == px_per_nm()) {
+        float ox, oy;
+        project(s_radar_img_view.clat, s_radar_img_view.clon, &c, &ox, &oy);
+        int32_t x1 = (int32_t)lroundf(ox) - s_radar_img_view.w / 2, y1 = (int32_t)lroundf(oy) - s_radar_img_view.h / 2;
+        lv_draw_image_dsc_t d;
+        lv_draw_image_dsc_init(&d);
+        d.src = s_radar_img;
+        lv_area_t a = {x1, y1, x1 + s_radar_img_view.w - 1, y1 + s_radar_img_view.h - 1};
+        lv_draw_image(layer, &d, &a);
+    }
+#endif
 
     /* range rings around the receiver */
     for (int i = 1; i <= 4; i++) {
@@ -566,6 +599,31 @@ static void radar_draw_cb(lv_event_t *e)
 }
 
 static void select_aircraft(uint32_t addr, bool show_details);
+
+/* The demo build shows placeholder network details, never the real ones */
+static void ui_ip_str(char *buf, int len)
+{
+#if CONFIG_ADSB_DEMO
+    strlcpy(buf, "192.168.1.123", len);
+#else
+    wifi_ip_str(buf, len);
+#endif
+}
+
+static volatile int s_req_tab = -1;
+static volatile int64_t s_req_select = -1;
+static volatile int s_req_range;
+static volatile bool s_req_pending;
+
+void ui_demo_request(int tab, int64_t select, int range_nm)
+{
+    s_req_tab = tab;
+    s_req_select = select;
+    s_req_range = range_nm;
+    s_req_pending = true;
+}
+
+static void apply_demo_request(void);
 
 static void radar_input_cb(lv_event_t *e)
 {
@@ -652,6 +710,78 @@ static void toggle_cb(lv_event_t *e)
     lv_obj_invalidate(s_radar);
 }
 
+#if CONFIG_ADSB_WX_VIEW
+static void radar_show(bool on)
+{
+    s_show_radar = on;
+    radar_enable(on);
+    if (s_radar_btn) lv_obj_set_style_bg_opa(s_radar_btn, on ? LV_OPA_COVER : LV_OPA_40, 0);
+    if (s_radar_lbl) {
+        if (on) lv_obj_remove_flag(s_radar_lbl, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_radar_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_invalidate(s_radar);
+}
+
+static void radar_toggle_cb(lv_event_t *e)
+{
+    radar_show(!s_show_radar);
+}
+
+static void update_weather(bool tab_visible);
+
+static void set_view(int v)
+{
+    s_view = v;
+    if (v == VIEW_WX) {
+        lv_obj_add_flag(s_tabview, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_wx_panel, LV_OBJ_FLAG_HIDDEN);
+        update_weather(true);
+    } else {
+        lv_obj_add_flag(s_wx_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_tabview, LV_OBJ_FLAG_HIDDEN);
+    }
+    radar_show(v == VIEW_WX);    /* each view starts with its usual layer; the map button still toggles it */
+    lv_label_set_text(lv_obj_get_child(s_view_btn, 0), v == VIEW_WX ? LV_SYMBOL_GPS " ADS-B" : LV_SYMBOL_CHARGE " Weather");
+    lv_obj_set_style_bg_color(s_view_btn, v == VIEW_WX ? COL_ACCENT : COL_RING, 0);
+}
+
+static void view_btn_cb(lv_event_t *e)
+{
+    set_view(s_view == VIEW_WX ? VIEW_ADSB : VIEW_WX);
+}
+
+/* LVGL task, 4 Hz: tell the radar task what the map shows, pick up finished images */
+static void radar_timer_cb(lv_timer_t *tm)
+{
+    if (!s_show_radar || board_screen_is_off()) return;
+    if (s_center_valid) {
+        radar_view_t v = {.clat = s_clat, .clon = s_clon, .px_per_nm = px_per_nm(), .w = SCR_W, .h = RADAR_H};
+        radar_set_view(&v);
+    }
+    radar_view_t iv;
+    const lv_image_dsc_t *img = radar_take(&iv);
+    if (img != s_radar_img || memcmp(&iv, &s_radar_img_view, sizeof(iv)) != 0) {
+        s_radar_img = img;
+        s_radar_img_view = iv;
+        lv_obj_invalidate(s_radar);
+    }
+    radar_info_t ri;
+    radar_get_info(&ri);
+    char b[96];
+    if (ri.status[0]) {
+        strlcpy(b, ri.status, sizeof(b));
+    } else if (ri.frame_time) {
+        struct tm tm;
+        localtime_r(&ri.frame_time, &tm);
+        strftime(b, sizeof(b), LV_SYMBOL_CHARGE " Radar %H:%M  (RainViewer)", &tm);
+    } else {
+        strlcpy(b, "Radar: RainViewer", sizeof(b));
+    }
+    if (strcmp(lv_label_get_text(s_radar_lbl), b) != 0) lv_label_set_text(s_radar_lbl, b);
+}
+#endif
+
 static lv_obj_t *radar_btn(lv_obj_t *parent, const char *txt, lv_align_t al, int32_t x, int32_t y,
                            lv_event_cb_t cb, void *ud)
 {
@@ -693,16 +823,33 @@ static void build_radar(lv_obj_t *scr)
     lv_obj_set_style_bg_color(b1, COL_PANEL, 0);
     lv_obj_set_style_bg_color(b2, COL_PANEL, 0);
     lv_obj_set_style_bg_color(b3, COL_PANEL, 0);
+#if CONFIG_ADSB_WX_VIEW
+    s_radar_btn = radar_btn(s_radar, LV_SYMBOL_CHARGE, LV_ALIGN_BOTTOM_LEFT, 12, -204, radar_toggle_cb, NULL);
+    lv_obj_set_style_bg_opa(s_radar_btn, LV_OPA_40, 0);
+#endif
 
     s_range_lbl = lv_label_create(s_radar);
     lv_obj_set_style_text_color(s_range_lbl, COL_DIM, 0);
     lv_obj_align(s_range_lbl, LV_ALIGN_TOP_RIGHT, -12, 10);
     update_range_label();
 
+    s_radar_wind = lv_label_create(s_radar);
+    lv_obj_set_style_text_color(s_radar_wind, COL_ACCENT, 0);
+    lv_obj_set_style_text_font(s_radar_wind, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_radar_wind, LV_ALIGN_TOP_RIGHT, -12, 34);
+    lv_obj_add_flag(s_radar_wind, LV_OBJ_FLAG_HIDDEN);
+
     s_center_lbl = lv_label_create(s_radar);
     lv_obj_set_style_text_color(s_center_lbl, COL_DIM, 0);
     lv_obj_set_style_text_font(s_center_lbl, &lv_font_montserrat_14, 0);
     lv_obj_align(s_center_lbl, LV_ALIGN_TOP_LEFT, 12, 10);
+#if CONFIG_ADSB_WX_VIEW
+    s_radar_lbl = lv_label_create(s_radar);
+    lv_obj_set_style_text_color(s_radar_lbl, COL_ACCENT, 0);
+    lv_obj_set_style_text_font(s_radar_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(s_radar_lbl, LV_ALIGN_TOP_LEFT, 12, 52);
+    lv_obj_add_flag(s_radar_lbl, LV_OBJ_FLAG_HIDDEN);
+#endif
 
     /* altitude colour legend */
     lv_obj_t *leg = lv_obj_create(s_radar);
@@ -749,6 +896,18 @@ static void build_topbar(lv_obj_t *scr)
     lv_obj_set_style_text_color(s_top_feed, COL_DIM, 0);
     lv_obj_set_width(s_top_feed, 420);
     lv_label_set_long_mode(s_top_feed, LV_LABEL_LONG_MODE_DOTS);
+
+#if CONFIG_ADSB_WX_VIEW
+    lv_obj_set_width(s_top_feed, 290);
+    s_view_btn = lv_button_create(bar);
+    lv_obj_set_size(s_view_btn, 150, 44);
+    lv_obj_align(s_view_btn, LV_ALIGN_LEFT_MID, 300, 0);
+    lv_obj_set_style_bg_color(s_view_btn, COL_RING, 0);
+    lv_obj_add_event_cb(s_view_btn, view_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *vl = lv_label_create(s_view_btn);
+    lv_label_set_text(vl, LV_SYMBOL_CHARGE " Weather");
+    lv_obj_center(vl);
+#endif
 
     s_top_count = lv_label_create(bar);
     lv_obj_align(s_top_count, LV_ALIGN_CENTER, 110, 0);
@@ -1380,7 +1539,7 @@ static void update_stats(void)
     lv_chart_set_axis_range(s_stats_chart, LV_CHART_AXIS_PRIMARY_Y, 0, maxv + maxv / 5);
 
     char ip[20];
-    wifi_ip_str(ip, sizeof(ip));
+    ui_ip_str(ip, sizeof(ip));
     uint32_t up = now_ms() / 1000;
     const app_settings_t *cfg = settings_get();
     char rng[24];
@@ -1394,6 +1553,8 @@ static void update_stats(void)
         "Bytes received: %lu, reconnects: %lu\n"
         "Wi-Fi: %s, %d dBm, IP %s\n"
         "Lookups: %lu req, %lu ok, %lu unknown, %lu errors\n"
+        "Weather: %s %s, %lu readings, %lu other sensors ignored\n"
+        "Airband: calls %s, audio %s, %lu calls, %lu KB\n"
         "Uptime: %luh %02lum   Heap: %u KB int / %u KB PSRAM\n"
         "Firmware: %s",
         st.msg_rate, (unsigned long)st.msgs_total, (unsigned long)st.msgs_good, (unsigned long)st.msgs_bad,
@@ -1403,6 +1564,9 @@ static void update_stats(void)
         (unsigned long)fs.bytes_rx, (unsigned long)(fs.connects ? fs.connects - 1 : 0),
         wifi_state_str(), wifi_rssi(), ip,
         (unsigned long)ls.requests, (unsigned long)ls.ok, (unsigned long)ls.not_found, (unsigned long)ls.errors,
+        wx_link_str(s_wx_view->link), s_wx_view->detail, (unsigned long)s_wx_view->msgs, (unsigned long)s_wx_view->ignored,
+        ab_link_str(s_ab_view->event_link), ab_link_str(s_ab_view->audio_link), (unsigned long)s_ab_view->calls,
+        (unsigned long)(s_ab_view->bytes_rx / 1024),
         (unsigned long)(up / 3600), (unsigned long)((up / 60) % 60),
         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -1427,6 +1591,844 @@ static void update_stats(void)
 /* ------------------------------------------------------------------------- */
 /* Settings                                                                  */
 /* ------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
+/* Weather                                                                   */
+/* ------------------------------------------------------------------------- */
+
+#define COL_TILE     lv_color_hex(0x1A2438)
+
+static lv_obj_t *s_wx_temp, *s_wx_feels, *s_wx_hilo;
+static lv_obj_t *s_wx_scale, *s_wx_needle, *s_wx_speed, *s_wx_gust, *s_wx_dir;
+static lv_obj_t *s_wx_hum, *s_wx_hum2, *s_wx_rain, *s_wx_rain2, *s_wx_uv, *s_wx_uv2, *s_wx_lux, *s_wx_lux2;
+static lv_obj_t *s_wx_status, *s_wx_chart_t, *s_wx_chart_w, *s_wx_chart_r;
+static lv_chart_series_t *s_wx_ser_t, *s_wx_ser_w, *s_wx_ser_g, *s_wx_ser_r;
+
+static wx_units_t wxu(void) { return settings_get()->wx_units; }
+
+static float wx_temp(float c) { return wxu() == WX_UNITS_IMPERIAL ? c * 9.0f / 5.0f + 32.0f : c; }
+static const char *wx_temp_unit(void) { return wxu() == WX_UNITS_IMPERIAL ? "\xC2\xB0""F" : "\xC2\xB0""C"; }
+static float wx_speed(float kmh)
+{
+    switch (wxu()) {
+    case WX_UNITS_IMPERIAL: return kmh / 1.609344f;
+    case WX_UNITS_MARINE:   return kmh / 1.852f;
+    default:                return kmh;
+    }
+}
+static const char *wx_speed_unit(void)
+{
+    switch (wxu()) {
+    case WX_UNITS_IMPERIAL: return "mph";
+    case WX_UNITS_MARINE:   return "kt";
+    default:                return "km/h";
+    }
+}
+static float wx_rain(float mm) { return wxu() == WX_UNITS_IMPERIAL ? mm / 25.4f : mm; }
+static const char *wx_rain_fmt(void) { return wxu() == WX_UNITS_IMPERIAL ? "%.2f in" : "%.1f mm"; }
+
+static lv_obj_t *wx_tile(lv_obj_t *parent, int32_t w, int32_t h, const char *title)
+{
+    lv_obj_t *t = lv_obj_create(parent);
+    lv_obj_set_size(t, w, h);
+    lv_obj_set_style_bg_color(t, COL_TILE, 0);
+    lv_obj_set_style_border_width(t, 0, 0);
+    lv_obj_set_style_radius(t, 12, 0);
+    lv_obj_set_style_pad_all(t, 12, 0);
+    lv_obj_remove_flag(t, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *l = lv_label_create(t);
+    lv_label_set_text(l, title);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(l, COL_DIM, 0);
+    lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, 0);
+    return t;
+}
+
+static lv_obj_t *wx_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t col, lv_align_t al, int32_t x, int32_t y)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, col, 0);
+    lv_obj_align(l, al, x, y);
+    lv_label_set_text(l, "-");
+    return l;
+}
+
+static lv_obj_t *wx_chart(lv_obj_t *parent, const char *title)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, title);
+    lv_obj_set_style_text_color(l, COL_DIM, 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_obj_t *c = lv_chart_create(parent);
+    lv_obj_set_size(c, lv_pct(100), 130);
+    lv_chart_set_type(c, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(c, WX_HIST_LEN);
+    lv_chart_set_div_line_count(c, 4, 6);
+    lv_obj_set_style_size(c, 0, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(c, COL_TILE, 0);
+    lv_obj_set_style_border_width(c, 0, 0);
+    lv_obj_set_style_radius(c, 12, 0);
+    return c;
+}
+
+static void build_weather_tab(lv_obj_t *tab)
+{
+    lv_obj_set_style_pad_all(tab, 8, 0);
+    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(tab, 8, 0);
+    lv_obj_set_style_pad_column(tab, 8, 0);
+
+    /* temperature */
+    lv_obj_t *t = wx_tile(tab, 384, 176, "TEMPERATURE");
+    s_wx_temp = wx_label(t, &lv_font_montserrat_48, COL_TEXT, LV_ALIGN_TOP_LEFT, 0, 22);
+    s_wx_feels = wx_label(t, &lv_font_montserrat_16, COL_DIM, LV_ALIGN_BOTTOM_LEFT, 0, -26);
+    s_wx_hilo = wx_label(t, &lv_font_montserrat_16, COL_DIM, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    /* wind: compass rose with a needle pointing to where the wind comes from */
+    t = wx_tile(tab, 384, 176, "WIND");
+    s_wx_scale = lv_scale_create(t);
+    lv_obj_set_size(s_wx_scale, 138, 138);
+    lv_obj_align(s_wx_scale, LV_ALIGN_LEFT_MID, 0, 8);
+    lv_scale_set_mode(s_wx_scale, LV_SCALE_MODE_ROUND_INNER);
+    lv_scale_set_range(s_wx_scale, 0, 360);
+    lv_scale_set_angle_range(s_wx_scale, 360);
+    lv_scale_set_rotation(s_wx_scale, 270);
+    lv_scale_set_total_tick_count(s_wx_scale, 17);
+    lv_scale_set_major_tick_every(s_wx_scale, 4);
+    lv_scale_set_label_show(s_wx_scale, true);
+    static const char *card[] = {"N", "E", "S", "W", "", NULL};
+    lv_scale_set_text_src(s_wx_scale, card);
+    lv_obj_set_style_text_color(s_wx_scale, COL_DIM, 0);
+    lv_obj_set_style_text_font(s_wx_scale, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_line_color(s_wx_scale, COL_RING, LV_PART_ITEMS);
+    lv_obj_set_style_line_color(s_wx_scale, COL_DIM, LV_PART_INDICATOR);
+    lv_obj_set_style_length(s_wx_scale, 6, LV_PART_ITEMS);
+    lv_obj_set_style_length(s_wx_scale, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_wx_scale, COL_RING, LV_PART_MAIN);
+    s_wx_needle = lv_line_create(s_wx_scale);
+    lv_obj_set_style_line_width(s_wx_needle, 4, 0);
+    lv_obj_set_style_line_color(s_wx_needle, COL_ACCENT, 0);
+    lv_obj_set_style_line_rounded(s_wx_needle, true, 0);
+    lv_obj_add_flag(s_wx_needle, LV_OBJ_FLAG_HIDDEN);
+    s_wx_speed = wx_label(t, &lv_font_montserrat_32, COL_TEXT, LV_ALIGN_TOP_LEFT, 160, 24);
+    s_wx_gust = wx_label(t, &lv_font_montserrat_16, COL_DIM, LV_ALIGN_TOP_LEFT, 160, 72);
+    s_wx_dir = wx_label(t, &lv_font_montserrat_16, COL_DIM, LV_ALIGN_TOP_LEFT, 160, 100);
+
+    /* four small tiles */
+    t = wx_tile(tab, 186, 112, "HUMIDITY");
+    s_wx_hum = wx_label(t, &lv_font_montserrat_28, COL_TEXT, LV_ALIGN_TOP_LEFT, 0, 20);
+    s_wx_hum2 = wx_label(t, &lv_font_montserrat_14, COL_DIM, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    t = wx_tile(tab, 186, 112, "RAIN TODAY");
+    s_wx_rain = wx_label(t, &lv_font_montserrat_28, COL_TEXT, LV_ALIGN_TOP_LEFT, 0, 20);
+    s_wx_rain2 = wx_label(t, &lv_font_montserrat_14, COL_DIM, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    t = wx_tile(tab, 186, 112, "UV INDEX");
+    s_wx_uv = wx_label(t, &lv_font_montserrat_28, COL_TEXT, LV_ALIGN_TOP_LEFT, 0, 20);
+    s_wx_uv2 = wx_label(t, &lv_font_montserrat_14, COL_DIM, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    t = wx_tile(tab, 186, 112, "LIGHT");
+    s_wx_lux = wx_label(t, &lv_font_montserrat_28, COL_TEXT, LV_ALIGN_TOP_LEFT, 0, 20);
+    s_wx_lux2 = wx_label(t, &lv_font_montserrat_14, COL_DIM, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    s_wx_status = lv_label_create(tab);
+    lv_obj_set_width(s_wx_status, lv_pct(100));
+    lv_obj_set_style_text_font(s_wx_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_wx_status, COL_DIM, 0);
+    lv_label_set_long_mode(s_wx_status, LV_LABEL_LONG_MODE_WRAP);
+
+    s_wx_chart_t = wx_chart(tab, "Temperature, last 24 h");
+    s_wx_ser_t = lv_chart_add_series(s_wx_chart_t, lv_color_hex(0xF59E0B), LV_CHART_AXIS_PRIMARY_Y);
+    s_wx_chart_w = wx_chart(tab, "Wind (blue) and gusts (grey), last 24 h");
+    s_wx_ser_g = lv_chart_add_series(s_wx_chart_w, lv_color_hex(0x64748B), LV_CHART_AXIS_PRIMARY_Y);
+    s_wx_ser_w = lv_chart_add_series(s_wx_chart_w, COL_ACCENT, LV_CHART_AXIS_PRIMARY_Y);
+    s_wx_chart_r = wx_chart(tab, "Rain, last 24 h (cumulative)");
+    s_wx_ser_r = lv_chart_add_series(s_wx_chart_r, lv_color_hex(0x38BDF8), LV_CHART_AXIS_PRIMARY_Y);
+}
+
+static const char *uv_label(float uvi, lv_color_t *col)
+{
+    if (uvi < 3)  { *col = lv_color_hex(0x22C55E); return "Low"; }
+    if (uvi < 6)  { *col = lv_color_hex(0xEAB308); return "Moderate"; }
+    if (uvi < 8)  { *col = lv_color_hex(0xF97316); return "High"; }
+    if (uvi < 11) { *col = lv_color_hex(0xEF4444); return "Very high"; }
+    *col = lv_color_hex(0xA855F7);
+    return "Extreme";
+}
+
+/* fill a chart from history; scale lets integer charts show decimals */
+static void wx_fill_chart(lv_obj_t *chart, lv_chart_series_t *ser, const wx_state_t *w, int which, float scale,
+                          int32_t *mn, int32_t *mx)
+{
+    int n = w->hist_n;
+    float base = n ? w->hist[0].rain_total_mm : 0;
+    for (int i = 0; i < WX_HIST_LEN; i++) {
+        int k = i - (WX_HIST_LEN - n);     /* right-align: newest at the right edge */
+        if (k < 0 || !w->hist[k].valid) { lv_chart_set_series_value_by_id(chart, ser, i, LV_CHART_POINT_NONE); continue; }
+        const wx_sample_t *s = &w->hist[k];
+        float v = which == 0 ? wx_temp(s->temp_c) : which == 1 ? wx_speed(s->wind_kmh) :
+                  which == 2 ? wx_speed(s->gust_kmh) : wx_rain(s->rain_total_mm - base);
+        int32_t iv = (int32_t)lroundf(v * scale);
+        lv_chart_set_series_value_by_id(chart, ser, i, iv);
+        if (iv < *mn) *mn = iv;
+        if (iv > *mx) *mx = iv;
+    }
+}
+
+static void update_weather(bool tab_visible)
+{
+    weather_get(s_wx_view);
+    const wx_state_t *w = s_wx_view;
+    uint32_t t = now_ms();
+    bool fresh = w->last_ms && t - w->last_ms < 10 * 60000;
+    char b[200];
+
+    /* wind summary on the radar, whichever tab is open */
+    if (fresh && w->wind_v) {
+        if (w->gust_v) {
+            snprintf(b, sizeof(b), "Wind %s %.0f G%.0f %s", w->dir_v ? wx_cardinal(w->dir_deg) : "",
+                     wx_speed(w->wind_kmh), wx_speed(w->gust_kmh), wx_speed_unit());
+        } else {
+            snprintf(b, sizeof(b), "Wind %s %.0f %s", w->dir_v ? wx_cardinal(w->dir_deg) : "",
+                     wx_speed(w->wind_kmh), wx_speed_unit());
+        }
+        lv_label_set_text(s_radar_wind, b);
+        lv_obj_remove_flag(s_radar_wind, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_radar_wind, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!tab_visible) return;
+
+    if (w->temp_v) {
+        snprintf(b, sizeof(b), "%.1f%s", wx_temp(w->temp_c), wx_temp_unit());
+        lv_label_set_text(s_wx_temp, b);
+        if (w->feels_v && w->dew_v) {
+            snprintf(b, sizeof(b), "Feels like %.0f\xC2\xB0   Dew point %.0f\xC2\xB0", wx_temp(w->feels_c), wx_temp(w->dew_c));
+        } else {
+            b[0] = 0;
+        }
+        lv_label_set_text(s_wx_feels, b);
+        if (w->day_v && w->temp_hi > -999) {
+            snprintf(b, sizeof(b), LV_SYMBOL_UP " %.1f\xC2\xB0   " LV_SYMBOL_DOWN " %.1f\xC2\xB0  today",
+                     wx_temp(w->temp_hi), wx_temp(w->temp_lo));
+        } else {
+            b[0] = 0;
+        }
+        lv_label_set_text(s_wx_hilo, b);
+    } else {
+        lv_label_set_text(s_wx_temp, "-");
+        lv_label_set_text(s_wx_feels, "");
+        lv_label_set_text(s_wx_hilo, "");
+    }
+
+    if (w->wind_v) {
+        snprintf(b, sizeof(b), "%.0f %s", wx_speed(w->wind_kmh), wx_speed_unit());
+        lv_label_set_text(s_wx_speed, b);
+        if (w->gust_v) snprintf(b, sizeof(b), "Gusts %.0f %s (max %.0f)", wx_speed(w->gust_kmh), wx_speed_unit(), wx_speed(w->gust_max_kmh));
+        else b[0] = 0;
+        lv_label_set_text(s_wx_gust, b);
+    } else {
+        lv_label_set_text(s_wx_speed, "-");
+        lv_label_set_text(s_wx_gust, "");
+    }
+    if (w->dir_v) {
+        snprintf(b, sizeof(b), "From %s (%.0f\xC2\xB0)", wx_cardinal(w->dir_deg), w->dir_deg);
+        lv_label_set_text(s_wx_dir, b);
+        lv_scale_set_line_needle_value(s_wx_scale, s_wx_needle, 52, (int32_t)lroundf(w->dir_deg));
+        lv_obj_remove_flag(s_wx_needle, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(s_wx_dir, "");
+        lv_obj_add_flag(s_wx_needle, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (w->hum_v) {
+        lv_label_set_text_fmt(s_wx_hum, "%.0f%%", w->hum);
+        if (w->dew_v) {
+            snprintf(b, sizeof(b), "Dew point %.0f%s", wx_temp(w->dew_c), wx_temp_unit());
+            lv_label_set_text(s_wx_hum2, b);
+        }
+    } else {
+        lv_label_set_text(s_wx_hum, "-");
+        lv_label_set_text(s_wx_hum2, "");
+    }
+
+    if (w->rain_v && w->day_v) {
+        snprintf(b, sizeof(b), wx_rain_fmt(), wx_rain(w->rain_today_mm));
+        lv_label_set_text(s_wx_rain, b);
+        char r[32];
+        snprintf(r, sizeof(r), wx_rain_fmt(), wx_rain(w->rain_rate_mmh));
+        snprintf(b, sizeof(b), "%s/h now", r);
+        lv_label_set_text(s_wx_rain2, b);
+    } else {
+        lv_label_set_text(s_wx_rain, "-");
+        lv_label_set_text(s_wx_rain2, w->rain_v ? "waiting for clock" : "");
+    }
+
+    if (w->uv_v) {
+        lv_color_t col;
+        const char *lbl = uv_label(w->uvi, &col);
+        lv_label_set_text_fmt(s_wx_uv, "%.0f", w->uvi);
+        lv_obj_set_style_text_color(s_wx_uv, col, 0);
+        lv_label_set_text(s_wx_uv2, lbl);
+    } else {
+        lv_label_set_text(s_wx_uv, "-");
+        lv_label_set_text(s_wx_uv2, "");
+    }
+
+    if (w->lux_v) {
+        if (w->lux >= 1000) snprintf(b, sizeof(b), "%.1f klx", w->lux / 1000.0f);
+        else snprintf(b, sizeof(b), "%.0f lx", w->lux);
+        lv_label_set_text(s_wx_lux, b);
+        /* daylight approximation: ~126.7 lux per W/m^2 */
+        snprintf(b, sizeof(b), "~%.0f W/m\xC2\xB2", w->lux / 126.7f);
+        lv_label_set_text(s_wx_lux2, b);
+    } else {
+        lv_label_set_text(s_wx_lux, "-");
+        lv_label_set_text(s_wx_lux2, "");
+    }
+
+    /* status line */
+    char age[24];
+    if (w->last_ms) snprintf(age, sizeof(age), "%lus ago", (unsigned long)((t - w->last_ms) / 1000));
+    else strcpy(age, "no reading yet");
+    if (w->link == WX_OFF) {
+        lv_label_set_text(s_wx_status, LV_SYMBOL_SETTINGS "  Set the weather feed (RF controller or rtl_433) in Settings.");
+    } else if (w->locked) {
+        snprintf(b, sizeof(b), "%s #%s  " LV_SYMBOL_BATTERY_FULL " %s  %s%s  %s  %s",
+                 w->model, w->id, w->batt_v ? (w->batt_ok ? "OK" : "LOW") : "-",
+                 LV_SYMBOL_REFRESH " ", age, w->link == WX_CONNECTED ? "" : wx_link_str(w->link), w->detail);
+        lv_label_set_text(s_wx_status, b);
+        lv_obj_set_style_text_color(s_wx_status, (w->batt_v && !w->batt_ok) || !fresh ? COL_WARN : COL_DIM, 0);
+    } else {
+        snprintf(b, sizeof(b), "%s %s - waiting for a weather station", wx_link_str(w->link), w->detail);
+        lv_label_set_text(s_wx_status, b);
+        lv_obj_set_style_text_color(s_wx_status, COL_DIM, 0);
+    }
+
+    /* charts */
+    int32_t mn = INT32_MAX, mx = INT32_MIN;
+    wx_fill_chart(s_wx_chart_t, s_wx_ser_t, w, 0, 10.0f, &mn, &mx);
+    if (mn <= mx) lv_chart_set_axis_range(s_wx_chart_t, LV_CHART_AXIS_PRIMARY_Y, mn - 10, mx + 10);
+    mn = 0; mx = 10;
+    wx_fill_chart(s_wx_chart_w, s_wx_ser_w, w, 1, 1.0f, &mn, &mx);
+    wx_fill_chart(s_wx_chart_w, s_wx_ser_g, w, 2, 1.0f, &mn, &mx);
+    lv_chart_set_axis_range(s_wx_chart_w, LV_CHART_AXIS_PRIMARY_Y, 0, mx + 2);
+    mn = 0; mx = 1;
+    wx_fill_chart(s_wx_chart_r, s_wx_ser_r, w, 3, 100.0f, &mn, &mx);
+    lv_chart_set_axis_range(s_wx_chart_r, LV_CHART_AXIS_PRIMARY_Y, 0, mx + mx / 10 + 1);
+    lv_chart_refresh(s_wx_chart_t);
+    lv_chart_refresh(s_wx_chart_w);
+    lv_chart_refresh(s_wx_chart_r);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Airband (GopherTrunk live audio)                                          */
+/* ------------------------------------------------------------------------- */
+
+
+static lv_obj_t *s_ab_btn_listen, *s_ab_lbl_listen, *s_ab_label, *s_ab_freq, *s_ab_status, *s_ab_level;
+static lv_obj_t *s_ab_btn_mute, *s_ab_slider, *s_ab_vol_lbl, *s_ab_chans, *s_ab_table, *s_ab_onair;
+static char s_ab_btn_serial[AB_MAX_CHANNELS + 2][48];
+static int s_ab_btn_n = -1;
+static char s_ab_btn_sig[AB_MAX_CHANNELS * 48 + 64];
+
+static lv_obj_t *s_ab_ta_freq, *s_ab_tune_status, *s_ab_presets_box;
+static ab_preset_t s_ab_presets[12];
+static int s_ab_preset_n;
+static char s_ab_presets_src[sizeof(((app_settings_t *)0)->ab_presets)] = "\x01";
+static lv_obj_t *s_ta_ab_token, *s_ta_ab_presets;
+static lv_obj_t *s_ab_guard_btn;
+static bool s_ab_guard_mode;
+static void ta_event_cb(lv_event_t *e);
+
+static void ab_persist(void)
+{
+#if !CONFIG_ADSB_DEMO
+    settings_save();
+#endif
+}
+
+static void ab_fmt_freq(uint32_t hz, char *b, size_t n)
+{
+    if (!hz) { b[0] = 0; return; }
+    snprintf(b, n, "%lu.%03lu MHz", (unsigned long)(hz / 1000000), (unsigned long)(hz / 1000 % 1000));
+}
+
+static void ab_listen_cb(lv_event_t *e)
+{
+    app_settings_t *c = settings_get();
+    c->ab_listen = !c->ab_listen;
+    ab_persist();
+    airband_restart();
+}
+
+static void ab_mute_cb(lv_event_t *e)
+{
+    app_settings_t *c = settings_get();
+    c->ab_mute = !c->ab_mute;
+    airband_apply_volume();
+    ab_persist();
+}
+
+static void ab_vol_cb(lv_event_t *e)
+{
+    app_settings_t *c = settings_get();
+    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+        c->ab_volume = (uint8_t)lv_slider_get_value(s_ab_slider);
+        lv_label_set_text_fmt(s_ab_vol_lbl, "%u%%", c->ab_volume);
+        airband_apply_volume();
+    } else if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        ab_persist();
+    }
+}
+
+/* tuning means "let me hear this": drop any channel filter and start listening */
+static void ab_start_tune(uint32_t hz, const char *label)
+{
+    app_settings_t *c = settings_get();
+    bool changed = false;
+    if (c->ab_filter[0]) {
+        c->ab_filter[0] = 0;
+        changed = true;
+    }
+    if (!c->ab_listen) {
+        c->ab_listen = true;
+        changed = true;
+    }
+    if (changed) {
+        ab_persist();
+        airband_restart();
+        s_ab_btn_sig[0] = 0;
+    }
+    airband_tune(hz, label);
+}
+
+static void ab_tune_cb(lv_event_t *e)
+{
+    uint32_t hz = airband_parse_freq(lv_textarea_get_text(s_ab_ta_freq));
+    lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_state(s_ab_ta_freq, LV_STATE_FOCUSED);
+    if (!hz) {
+        lv_label_set_text(s_ab_tune_status, LV_SYMBOL_WARNING "  Enter a frequency in MHz, e.g. 118.700");
+        lv_obj_set_style_text_color(s_ab_tune_status, COL_WARN, 0);
+        return;
+    }
+    /* use the preset's name if the frequency matches one */
+    const char *label = "";
+    for (int i = 0; i < s_ab_preset_n; i++) {
+        if (s_ab_presets[i].hz == hz) label = s_ab_presets[i].label;
+    }
+    ab_start_tune(hz, label);
+}
+
+static void ab_scan_cb(lv_event_t *e)
+{
+    airband_resume_scan();
+}
+
+/* guarded presets: amber border and an eye next to the name */
+static void ab_style_presets(void)
+{
+    const app_settings_t *c = settings_get();
+    for (int i = 0; i < s_ab_preset_n; i++) {
+        lv_obj_t *b = lv_obj_get_child(s_ab_presets_box, i);
+        if (!b) break;
+        bool g = airband_guard_has(c->ab_guard, s_ab_presets[i].hz);
+        lv_obj_set_style_border_width(b, g ? 3 : (s_ab_guard_mode ? 1 : 0), 0);
+        lv_obj_set_style_border_color(b, g ? COL_WARN : COL_DIM, 0);
+        lv_label_set_text_fmt(lv_obj_get_child(b, 0), "%s%s\n%lu.%03lu", g ? LV_SYMBOL_EYE_OPEN " " : "",
+                              s_ab_presets[i].label, (unsigned long)(s_ab_presets[i].hz / 1000000),
+                              (unsigned long)(s_ab_presets[i].hz / 1000 % 1000));
+    }
+    if (s_ab_guard_btn) {
+        lv_obj_set_style_bg_color(s_ab_guard_btn, s_ab_guard_mode ? COL_WARN : COL_RING, 0);
+        lv_label_set_text(lv_obj_get_child(s_ab_guard_btn, 0), s_ab_guard_mode ? LV_SYMBOL_OK " Done" : LV_SYMBOL_EYE_OPEN " Guard");
+    }
+}
+
+static void ab_guard_toggle(int i)
+{
+    app_settings_t *c = settings_get();
+    airband_guard_toggle(c->ab_guard, sizeof(c->ab_guard), s_ab_presets[i].hz);
+    ab_persist();
+    ab_style_presets();
+    airband_sync_guards();
+}
+
+static void ab_guard_mode_cb(lv_event_t *e)
+{
+    s_ab_guard_mode = !s_ab_guard_mode;
+    ab_style_presets();
+    if (s_ab_guard_mode) {
+        lv_label_set_text(s_ab_tune_status, "Tap the presets to guard, then Done. Guarded channels stay on the scan list.");
+        lv_obj_set_style_text_color(s_ab_tune_status, COL_WARN, 0);
+    }
+}
+
+static void ab_preset_long_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i >= 0 && i < s_ab_preset_n) ab_guard_toggle(i);
+}
+
+static void ab_preset_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= s_ab_preset_n) return;
+    if (s_ab_guard_mode) {
+        ab_guard_toggle(i);
+        return;
+    }
+    char f[16];
+    snprintf(f, sizeof(f), "%lu.%03lu", (unsigned long)(s_ab_presets[i].hz / 1000000),
+             (unsigned long)(s_ab_presets[i].hz / 1000 % 1000));
+    lv_textarea_set_text(s_ab_ta_freq, f);
+    ab_start_tune(s_ab_presets[i].hz, s_ab_presets[i].label);
+}
+
+static void ab_rebuild_presets(void)
+{
+    const app_settings_t *c = settings_get();
+    if (strcmp(s_ab_presets_src, c->ab_presets) == 0) return;
+    strlcpy(s_ab_presets_src, c->ab_presets, sizeof(s_ab_presets_src));
+    s_ab_preset_n = airband_parse_presets(c->ab_presets, s_ab_presets, 12);
+    lv_obj_clean(s_ab_presets_box);
+    for (int i = 0; i < s_ab_preset_n; i++) {
+        lv_obj_t *b = lv_button_create(s_ab_presets_box);
+        lv_obj_set_size(b, 180, 64);
+        lv_obj_set_style_bg_color(b, COL_BG, 0);
+        lv_obj_set_style_bg_color(b, COL_ACCENT, LV_STATE_CHECKED);
+        lv_obj_add_event_cb(b, ab_preset_cb, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(b, ab_preset_long_cb, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
+        lv_obj_t *l = lv_label_create(b);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(l);
+    }
+    ab_style_presets();
+    if (!s_ab_preset_n) {
+        lv_obj_t *l = lv_label_create(s_ab_presets_box);
+        lv_label_set_text(l, "No presets: add them in Settings (e.g. \"Tower 118.700; Ground 121.900\")");
+        lv_obj_set_style_text_color(l, COL_DIM, 0);
+    }
+}
+
+static void ab_chan_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    app_settings_t *c = settings_get();
+    if (i < 0 || i >= s_ab_btn_n || strcmp(c->ab_filter, s_ab_btn_serial[i]) == 0) return;
+    strlcpy(c->ab_filter, s_ab_btn_serial[i], sizeof(c->ab_filter));
+    ab_persist();
+    airband_restart();
+    s_ab_btn_sig[0] = 0;     /* restyle on the next update */
+}
+
+static void build_airband_tab(lv_obj_t *tab)
+{
+    s_ab_view = heap_caps_calloc(1, sizeof(ab_state_t), MALLOC_CAP_SPIRAM);
+    const app_settings_t *c = settings_get();
+    lv_obj_set_style_pad_all(tab, 8, 0);
+    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(tab, 8, 0);
+    lv_obj_set_style_pad_column(tab, 8, 0);
+
+    lv_obj_t *l;
+
+    /* now playing */
+    lv_obj_t *t = wx_tile(tab, lv_pct(100), 160, "AIRBAND");
+    s_ab_btn_listen = lv_button_create(t);
+    lv_obj_set_size(s_ab_btn_listen, 170, 108);
+    lv_obj_align(s_ab_btn_listen, LV_ALIGN_LEFT_MID, 0, 10);
+    lv_obj_add_event_cb(s_ab_btn_listen, ab_listen_cb, LV_EVENT_CLICKED, NULL);
+    s_ab_lbl_listen = lv_label_create(s_ab_btn_listen);
+    lv_obj_set_style_text_font(s_ab_lbl_listen, &lv_font_montserrat_24, 0);
+    lv_obj_center(s_ab_lbl_listen);
+
+    s_ab_label = wx_label(t, &lv_font_montserrat_32, COL_TEXT, LV_ALIGN_TOP_LEFT, 190, 20);
+    lv_label_set_long_mode(s_ab_label, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(s_ab_label, 500);
+    s_ab_freq = wx_label(t, &lv_font_montserrat_20, COL_ACCENT, LV_ALIGN_TOP_LEFT, 190, 62);
+    s_ab_status = wx_label(t, &lv_font_montserrat_14, COL_DIM, LV_ALIGN_TOP_LEFT, 190, 96);
+    lv_label_set_long_mode(s_ab_status, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(s_ab_status, 500);
+
+    s_ab_level = lv_bar_create(t);
+    lv_obj_set_size(s_ab_level, 22, 120);
+    lv_obj_align(s_ab_level, LV_ALIGN_RIGHT_MID, 0, 6);
+    lv_bar_set_range(s_ab_level, 0, 100);
+    lv_obj_set_style_bg_color(s_ab_level, COL_BG, 0);
+    lv_obj_set_style_bg_color(s_ab_level, COL_OK, LV_PART_INDICATOR);
+
+    /* tuning */
+    t = wx_tile(tab, lv_pct(100), LV_SIZE_CONTENT, "TUNE  (AM)");
+    lv_obj_set_flex_flow(t, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(t, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(t, 8, 0);
+    lv_obj_set_style_pad_column(t, 10, 0);
+    lv_obj_t *brk = lv_obj_get_child(t, 0);          /* title on its own line */
+    lv_obj_set_width(brk, lv_pct(100));
+    s_ab_ta_freq = lv_textarea_create(t);
+    lv_textarea_set_one_line(s_ab_ta_freq, true);
+    lv_textarea_set_accepted_chars(s_ab_ta_freq, "0123456789.");
+    lv_textarea_set_max_length(s_ab_ta_freq, 8);
+    lv_textarea_set_placeholder_text(s_ab_ta_freq, "118.700");
+    lv_obj_set_style_text_font(s_ab_ta_freq, &lv_font_montserrat_32, 0);
+    lv_obj_set_width(s_ab_ta_freq, 220);
+    lv_obj_add_event_cb(s_ab_ta_freq, ta_event_cb, LV_EVENT_ALL, (void *)(intptr_t)true);
+    l = lv_label_create(t);
+    lv_label_set_text(l, "MHz");
+    lv_obj_set_style_text_color(l, COL_DIM, 0);
+    lv_obj_t *b = lv_button_create(t);
+    lv_obj_set_size(b, 150, 60);
+    lv_obj_set_style_bg_color(b, COL_ACCENT, 0);
+    lv_obj_add_event_cb(b, ab_tune_cb, LV_EVENT_CLICKED, NULL);
+    l = lv_label_create(b);
+    lv_label_set_text(l, LV_SYMBOL_GPS " Tune");
+    lv_obj_center(l);
+    b = lv_button_create(t);
+    lv_obj_set_size(b, 150, 60);
+    lv_obj_set_style_bg_color(b, COL_RING, 0);
+    lv_obj_add_event_cb(b, ab_scan_cb, LV_EVENT_CLICKED, NULL);
+    l = lv_label_create(b);
+    lv_label_set_text(l, LV_SYMBOL_REFRESH " Scan");
+    lv_obj_center(l);
+    s_ab_guard_btn = lv_button_create(t);
+    lv_obj_set_size(s_ab_guard_btn, 150, 60);
+    lv_obj_set_style_bg_color(s_ab_guard_btn, COL_RING, 0);
+    lv_obj_add_event_cb(s_ab_guard_btn, ab_guard_mode_cb, LV_EVENT_CLICKED, NULL);
+    l = lv_label_create(s_ab_guard_btn);
+    lv_label_set_text(l, LV_SYMBOL_EYE_OPEN " Guard");
+    lv_obj_center(l);
+    s_ab_tune_status = lv_label_create(t);
+    lv_obj_set_width(s_ab_tune_status, lv_pct(100));
+    lv_obj_set_style_text_font(s_ab_tune_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_ab_tune_status, COL_DIM, 0);
+    lv_label_set_text(s_ab_tune_status, "Tap a preset, or enter a frequency and tap Tune. Guard picks presets to keep watching.");
+    s_ab_presets_box = lv_obj_create(t);
+    lv_obj_remove_style_all(s_ab_presets_box);
+    lv_obj_set_size(s_ab_presets_box, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_ab_presets_box, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(s_ab_presets_box, 8, 0);
+    lv_obj_set_style_pad_column(s_ab_presets_box, 8, 0);
+    ab_rebuild_presets();
+
+    /* volume */
+    t = wx_tile(tab, lv_pct(100), 84, "VOLUME");
+    s_ab_btn_mute = lv_button_create(t);
+    lv_obj_set_size(s_ab_btn_mute, 70, 48);
+    lv_obj_align(s_ab_btn_mute, LV_ALIGN_LEFT_MID, 0, 8);
+    lv_obj_add_event_cb(s_ab_btn_mute, ab_mute_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(lv_label_create(s_ab_btn_mute));
+    s_ab_slider = lv_slider_create(t);
+    lv_obj_set_width(s_ab_slider, 520);
+    lv_obj_align(s_ab_slider, LV_ALIGN_LEFT_MID, 100, 8);
+    lv_slider_set_range(s_ab_slider, 0, 100);
+    lv_slider_set_value(s_ab_slider, c->ab_volume, LV_ANIM_OFF);
+    lv_obj_add_event_cb(s_ab_slider, ab_vol_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_ab_slider, ab_vol_cb, LV_EVENT_RELEASED, NULL);
+    s_ab_vol_lbl = wx_label(t, &lv_font_montserrat_20, COL_TEXT, LV_ALIGN_RIGHT_MID, 0, 8);
+    lv_label_set_text_fmt(s_ab_vol_lbl, "%u%%", c->ab_volume);
+
+    /* channel filter */
+    l = lv_label_create(tab);
+    lv_label_set_text(l, "CHANNELS  (tap one to hear only that channel)");
+    lv_obj_set_style_text_color(l, COL_DIM, 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(l, lv_pct(100));
+    s_ab_chans = lv_obj_create(tab);
+    lv_obj_remove_style_all(s_ab_chans);
+    lv_obj_set_size(s_ab_chans, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_ab_chans, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(s_ab_chans, 6, 0);
+    lv_obj_set_style_pad_column(s_ab_chans, 6, 0);
+
+    /* recent transmissions */
+    l = lv_label_create(tab);
+    lv_label_set_text(l, "RECENT TRANSMISSIONS");
+    lv_obj_set_style_text_color(l, COL_DIM, 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(l, lv_pct(100));
+    s_ab_table = lv_table_create(tab);
+    lv_obj_set_width(s_ab_table, lv_pct(100));
+    lv_table_set_column_count(s_ab_table, 4);
+    static const int32_t w[4] = {130, 330, 180, 120};
+    static const char *hdr[4] = {"Time", "Channel", "Frequency", "Length"};
+    for (int i = 0; i < 4; i++) {
+        lv_table_set_column_width(s_ab_table, i, w[i]);
+        lv_table_set_cell_value(s_ab_table, 0, i, hdr[i]);
+    }
+    lv_obj_set_style_pad_ver(s_ab_table, 6, LV_PART_ITEMS);
+    lv_obj_set_style_pad_hor(s_ab_table, 4, LV_PART_ITEMS);
+    lv_obj_set_style_text_font(s_ab_table, &lv_font_montserrat_16, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(s_ab_table, 0, LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(s_ab_table, COL_PANEL, 0);
+    lv_obj_set_style_bg_color(s_ab_table, COL_TILE, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(s_ab_table, COL_TEXT, LV_PART_ITEMS);
+
+    /* on-air banner on the radar, visible from every tab while listening */
+    s_ab_onair = lv_label_create(s_radar);
+    lv_obj_set_style_text_color(s_ab_onair, COL_OK, 0);
+    lv_obj_set_style_text_font(s_ab_onair, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_ab_onair, LV_ALIGN_TOP_RIGHT, -12, 58);
+    lv_obj_add_flag(s_ab_onair, LV_OBJ_FLAG_HIDDEN);
+}
+
+static lv_obj_t *ab_chan_btn(int idx, const char *text)
+{
+    lv_obj_t *b = lv_button_create(s_ab_chans);
+    lv_obj_set_height(b, 48);
+    lv_obj_set_style_bg_color(b, COL_TILE, 0);
+    lv_obj_set_style_bg_color(b, COL_ACCENT, LV_STATE_CHECKED);
+    lv_obj_set_style_border_color(b, COL_OK, 0);
+    lv_obj_add_event_cb(b, ab_chan_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    return b;
+}
+
+static void update_airband_chans(const ab_state_t *a)
+{
+    const app_settings_t *c = settings_get();
+    /* rebuild the buttons only when the channel set or filter changes */
+    char sig[sizeof(s_ab_btn_sig)];
+    int o = snprintf(sig, sizeof(sig), "%s|", c->ab_filter);
+    for (int i = 0; i < a->ch_n && o < (int)sizeof(sig) - 50; i++) o += snprintf(sig + o, sizeof(sig) - o, "%s/%s|", a->ch[i].serial, a->ch[i].label);
+    if (strcmp(sig, s_ab_btn_sig) != 0) {
+        strlcpy(s_ab_btn_sig, sig, sizeof(s_ab_btn_sig));
+        lv_obj_clean(s_ab_chans);
+        s_ab_btn_n = 0;
+        s_ab_btn_serial[s_ab_btn_n][0] = 0;
+        ab_chan_btn(s_ab_btn_n++, "All channels");
+        bool filter_listed = !c->ab_filter[0];
+        for (int i = 0; i < a->ch_n; i++) {
+            char t[64], f[20];
+            ab_fmt_freq(a->ch[i].freq_hz, f, sizeof(f));
+            if (f[0] && strncmp(a->ch[i].label, f, 7) != 0) snprintf(t, sizeof(t), "%s  %.7s", a->ch[i].label, f);
+            else strlcpy(t, a->ch[i].label, sizeof(t));
+            strlcpy(s_ab_btn_serial[s_ab_btn_n], a->ch[i].serial, sizeof(s_ab_btn_serial[0]));
+            ab_chan_btn(s_ab_btn_n++, t);
+            if (strcmp(a->ch[i].serial, c->ab_filter) == 0) filter_listed = true;
+        }
+        if (!filter_listed) {
+            /* the saved filter's channel hasn't keyed up since boot */
+            strlcpy(s_ab_btn_serial[s_ab_btn_n], c->ab_filter, sizeof(s_ab_btn_serial[0]));
+            ab_chan_btn(s_ab_btn_n++, c->ab_filter);
+        }
+    }
+    /* selection and on-air highlight */
+    for (int i = 0; i < s_ab_btn_n; i++) {
+        lv_obj_t *b = lv_obj_get_child(s_ab_chans, i);
+        if (!b) break;
+        if (strcmp(s_ab_btn_serial[i], c->ab_filter) == 0) lv_obj_add_state(b, LV_STATE_CHECKED);
+        else lv_obj_remove_state(b, LV_STATE_CHECKED);
+        bool on = false;
+        for (int k = 0; k < a->ch_n; k++) {
+            if (a->ch[k].on_air && (i == 0 ? false : strcmp(a->ch[k].serial, s_ab_btn_serial[i]) == 0)) on = true;
+        }
+        lv_obj_set_style_border_width(b, on ? 3 : 0, 0);
+    }
+}
+
+static void update_airband(bool tab_visible)
+{
+    airband_get(s_ab_view);
+    const ab_state_t *a = s_ab_view;
+    const app_settings_t *c = settings_get();
+    char b[160], f[24];
+
+    /* radar banner */
+    if (c->ab_listen && a->on_air) {
+        ab_fmt_freq(a->freq_hz, f, sizeof(f));
+        snprintf(b, sizeof(b), LV_SYMBOL_AUDIO " %s  %s", a->label, f);
+        lv_label_set_text(s_ab_onair, b);
+        lv_obj_remove_flag(s_ab_onair, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_ab_onair, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!tab_visible) return;
+
+    lv_label_set_text(s_ab_lbl_listen, c->ab_listen ? LV_SYMBOL_STOP " Stop" : LV_SYMBOL_PLAY " Listen");
+    lv_obj_set_style_bg_color(s_ab_btn_listen, c->ab_listen ? COL_EMERG : COL_OK, 0);
+    lv_label_set_text(lv_obj_get_child(s_ab_btn_mute, 0), c->ab_mute ? LV_SYMBOL_MUTE : LV_SYMBOL_VOLUME_MAX);
+    lv_obj_set_style_bg_color(s_ab_btn_mute, c->ab_mute ? COL_WARN : COL_TILE, 0);
+    lv_bar_set_value(s_ab_level, a->playing ? a->level : 0, LV_ANIM_OFF);
+
+    if (a->on_air) {
+        lv_label_set_text(s_ab_label, a->label);
+        ab_fmt_freq(a->freq_hz, f, sizeof(f));
+        uint32_t s = (now_ms() - a->on_air_since_ms) / 1000;
+        snprintf(b, sizeof(b), "%s   " LV_SYMBOL_AUDIO " on air %lus", f, (unsigned long)s);
+        lv_label_set_text(s_ab_freq, b);
+    } else if (a->tuned) {
+        lv_label_set_text(s_ab_label, a->tuned_label);
+        ab_fmt_freq(a->tuned_hz, f, sizeof(f));
+        snprintf(b, sizeof(b), "%s   holding, waiting for a transmission", f);
+        lv_label_set_text(s_ab_freq, b);
+    } else {
+        lv_label_set_text(s_ab_label, a->log_n ? "Quiet" : "No transmissions yet");
+        if (a->log_n) {
+            ab_fmt_freq(a->log[0].freq_hz, f, sizeof(f));
+            snprintf(b, sizeof(b), "Last: %s  %s", a->log[0].label, f);
+            lv_label_set_text(s_ab_freq, b);
+        } else {
+            lv_label_set_text(s_ab_freq, "");
+        }
+    }
+
+    if (!c->ab_host[0]) {
+        lv_label_set_text(s_ab_status, LV_SYMBOL_SETTINGS "  Set the GopherTrunk server in Settings.");
+    } else if (!a->codec_ok && c->ab_listen) {
+        lv_label_set_text(s_ab_status, LV_SYMBOL_WARNING "  Audio codec not found");
+    } else if (c->ab_listen && a->audio_link != AB_CONNECTED) {
+        snprintf(b, sizeof(b), "Audio: %s %s", ab_link_str(a->audio_link), a->audio_detail);
+        lv_label_set_text(s_ab_status, b);
+    } else if (a->event_link != AB_CONNECTED) {
+        snprintf(b, sizeof(b), "Calls: %s %s", ab_link_str(a->event_link), a->event_detail);
+        lv_label_set_text(s_ab_status, b);
+    } else if (c->ab_listen) {
+        snprintf(b, sizeof(b), "%lu Hz  buffer %lu ms  %lu calls", (unsigned long)a->rate,
+                 (unsigned long)a->buffered_ms, (unsigned long)a->calls);
+        lv_label_set_text(s_ab_status, b);
+    } else {
+        snprintf(b, sizeof(b), "Tap Listen to hear the scanner  (%lu calls)", (unsigned long)a->calls);
+        lv_label_set_text(s_ab_status, b);
+    }
+
+    update_airband_chans(a);
+
+    ab_rebuild_presets();
+    if (a->tune_status[0] && !s_ab_guard_mode) {
+        lv_label_set_text(s_ab_tune_status, a->tune_status);
+        lv_obj_set_style_text_color(s_ab_tune_status, a->tune_error ? COL_WARN : a->tune_busy ? COL_DIM : COL_OK, 0);
+    }
+    for (int i = 0; i < s_ab_preset_n; i++) {
+        lv_obj_t *pb = lv_obj_get_child(s_ab_presets_box, i);
+        if (!pb) break;
+        if (a->tuned && a->tuned_hz == s_ab_presets[i].hz) lv_obj_add_state(pb, LV_STATE_CHECKED);
+        else lv_obj_remove_state(pb, LV_STATE_CHECKED);
+    }
+
+    lv_table_set_row_count(s_ab_table, 1 + a->log_n);
+    for (int i = 0; i < a->log_n; i++) {
+        const ab_log_t *e = &a->log[i];
+        struct tm tm;
+        localtime_r(&e->start, &tm);
+        strftime(b, sizeof(b), "%H:%M:%S", &tm);
+        lv_table_set_cell_value(s_ab_table, i + 1, 0, b);
+        lv_table_set_cell_value(s_ab_table, i + 1, 1, e->label);
+        ab_fmt_freq(e->freq_hz, f, sizeof(f));
+        lv_table_set_cell_value(s_ab_table, i + 1, 2, f);
+        if (e->dur_ms) snprintf(b, sizeof(b), "%.1f s", e->dur_ms / 1000.0f);
+        else strlcpy(b, "on air", sizeof(b));
+        lv_table_set_cell_value(s_ab_table, i + 1, 3, b);
+    }
+}
+
+static void airband_timer_cb(lv_timer_t *tm)
+{
+    /* fast refresh for the level meter while the tab is open */
+    if (lv_tabview_get_tab_active(s_tabview) == TAB_AIRBAND && !board_screen_is_off()) update_airband(true);
+}
 
 static void kb_event_cb(lv_event_t *e)
 {
@@ -1634,7 +2636,7 @@ static void update_fw_section(void)
     ota_status_t st;
     ota_get_status(&st);
     char ip[20];
-    wifi_ip_str(ip, sizeof(ip));
+    ui_ip_str(ip, sizeof(ip));
 
     lv_label_set_text_fmt(s_fw_lbl, "Firmware %s (%s, %s)%s\nPrevious: %s",
                           st.version, st.partition, st.build_date,
@@ -1672,9 +2674,18 @@ static void update_fw_section(void)
 
 static void save_cb(lv_event_t *e)
 {
+#if CONFIG_ADSB_DEMO
+    lv_label_set_text(s_set_status, LV_SYMBOL_WARNING " Demo mode: settings are not saved");
+    return;
+#endif
     app_settings_t *c = settings_get();
-    char old_ssid[33], old_pass[65], old_host[64];
-    uint16_t old_port = c->port;
+    char old_ssid[33], old_pass[65], old_host[64], old_wx[64], old_ab[64];
+    static char old_abp[sizeof(c->ab_presets)], old_tok[sizeof(c->ab_token)];
+    strlcpy(old_abp, c->ab_presets, sizeof(old_abp));
+    strlcpy(old_tok, c->ab_token, sizeof(old_tok));
+    uint16_t old_port = c->port, old_wx_port = c->wx_port, old_ab_port = c->ab_port;
+    strlcpy(old_wx, c->wx_host, sizeof(old_wx));
+    strlcpy(old_ab, c->ab_host, sizeof(old_ab));
     feed_proto_t old_proto = c->proto;
     strlcpy(old_ssid, c->wifi_ssid, sizeof(old_ssid));
     strlcpy(old_pass, c->wifi_pass, sizeof(old_pass));
@@ -1691,6 +2702,15 @@ static void save_cb(lv_event_t *e)
     if (c->rx_lat < -90 || c->rx_lat > 90) c->rx_lat = 0;
     if (c->rx_lon < -180 || c->rx_lon > 180) c->rx_lon = 0;
     c->units = (units_t)lv_dropdown_get_selected(s_dd_units);
+    strlcpy(c->wx_host, lv_textarea_get_text(s_ta_wx_host), sizeof(c->wx_host));
+    int wxp = atoi(lv_textarea_get_text(s_ta_wx_port));
+    c->wx_port = (wxp > 0 && wxp < 65536) ? (uint16_t)wxp : 8433;
+    c->wx_units = (wx_units_t)lv_dropdown_get_selected(s_dd_wx_units);
+    strlcpy(c->ab_host, lv_textarea_get_text(s_ta_ab_host), sizeof(c->ab_host));
+    int abp = atoi(lv_textarea_get_text(s_ta_ab_port));
+    c->ab_port = (abp > 0 && abp < 65536) ? (uint16_t)abp : 8080;
+    strlcpy(c->ab_token, lv_textarea_get_text(s_ta_ab_token), sizeof(c->ab_token));
+    strlcpy(c->ab_presets, lv_textarea_get_text(s_ta_ab_presets), sizeof(c->ab_presets));
     c->tz = (uint8_t)lv_dropdown_get_selected(s_dd_tz);
     c->flip = lv_dropdown_get_selected(s_dd_flip) == 1;
     c->saver = lv_obj_has_state(s_sw_saver, LV_STATE_CHECKED);
@@ -1702,6 +2722,12 @@ static void save_cb(lv_event_t *e)
 
     if (strcmp(old_ssid, c->wifi_ssid) || strcmp(old_pass, c->wifi_pass)) wifi_apply_settings();
     if (strcmp(old_host, c->host) || old_port != c->port || old_proto != c->proto) adsb_client_restart();
+    if (strcmp(old_wx, c->wx_host) || old_wx_port != c->wx_port) weather_restart();
+    if (strcmp(old_ab, c->ab_host) || old_ab_port != c->ab_port) airband_restart();
+    if (strcmp(old_ab, c->ab_host) || old_ab_port != c->ab_port || strcmp(old_abp, c->ab_presets) ||
+        strcmp(old_tok, c->ab_token)) {
+        airband_sync_guards();
+    }
 
     s_center_on_rx = true;
     s_center_valid = false;
@@ -1720,7 +2746,11 @@ static void build_settings_tab(lv_obj_t *tab)
     lv_obj_set_style_pad_row(tab, 2, 0);
 
     lv_obj_t *r = form_row(tab, "Wi-Fi network");
+#if CONFIG_ADSB_DEMO
+    s_ta_ssid = form_ta(r, "MyHomeWiFi", 300, false, false);
+#else
     s_ta_ssid = form_ta(r, c->wifi_ssid, 300, false, false);
+#endif
     s_btn_scan = lv_button_create(r);
     lv_obj_t *l = lv_label_create(s_btn_scan);
     lv_label_set_text(l, LV_SYMBOL_REFRESH " Scan");
@@ -1736,7 +2766,11 @@ static void build_settings_tab(lv_obj_t *tab)
     s_ta_pass = form_ta(r, c->wifi_pass, 440, false, true);
 
     r = form_row(tab, "ADS-B server");
+#if CONFIG_ADSB_DEMO
+    s_ta_host = form_ta(r, "192.168.1.50", 300, false, false);
+#else
     s_ta_host = form_ta(r, c->host, 300, false, false);
+#endif
     snprintf(b, sizeof(b), "%u", c->port);
     s_ta_port = form_ta(r, b, 130, true, false);
 
@@ -1752,6 +2786,42 @@ static void build_settings_tab(lv_obj_t *tab)
     s_ta_lat = form_ta(r, b, 215, true, false);
     snprintf(b, sizeof(b), "%.5f", c->rx_lon);
     s_ta_lon = form_ta(r, b, 215, true, false);
+
+    r = form_row(tab, "Weather server");
+#if CONFIG_ADSB_DEMO
+    s_ta_wx_host = form_ta(r, "192.168.1.60", 300, false, false);
+#else
+    s_ta_wx_host = form_ta(r, c->wx_host, 300, false, false);
+#endif
+    snprintf(b, sizeof(b), "%u", c->wx_port);
+    s_ta_wx_port = form_ta(r, b, 130, true, false);
+
+    r = form_row(tab, "GopherTrunk server");
+#if CONFIG_ADSB_DEMO
+    s_ta_ab_host = form_ta(r, "192.168.1.60", 300, false, false);
+#else
+    s_ta_ab_host = form_ta(r, c->ab_host, 300, false, false);
+#endif
+    snprintf(b, sizeof(b), "%u", c->ab_port);
+    s_ta_ab_port = form_ta(r, b, 130, true, false);
+
+    r = form_row(tab, "GopherTrunk token");
+    s_ta_ab_token = form_ta(r, c->ab_token, 440, false, true);
+    lv_textarea_set_placeholder_text(s_ta_ab_token, "only needed for tuning");
+
+    r = form_row(tab, "Tune presets");
+#if CONFIG_ADSB_DEMO
+    s_ta_ab_presets = form_ta(r, "Tower 118.700; Ground 121.900; Guard 121.500", 440, false, false);
+#else
+    s_ta_ab_presets = form_ta(r, c->ab_presets, 440, false, false);
+#endif
+    lv_textarea_set_placeholder_text(s_ta_ab_presets, "Tower 118.700; Ground 121.900");
+
+    r = form_row(tab, "Weather units");
+    s_dd_wx_units = lv_dropdown_create(r);
+    lv_dropdown_set_options(s_dd_wx_units, "Metric (°C, km/h, mm)\nImperial (°F, mph, in)\nMarine (°C, kt, mm)");
+    lv_dropdown_set_selected(s_dd_wx_units, c->wx_units);
+    lv_obj_set_width(s_dd_wx_units, 440);
 
     r = form_row(tab, "Units");
     s_dd_units = lv_dropdown_create(r);
@@ -1885,7 +2955,12 @@ static void select_aircraft(uint32_t addr, bool show_details)
     update_details();
     update_list();
     lv_obj_invalidate(s_radar);
-    if (show_details) lv_tabview_set_active(s_tabview, 1, LV_ANIM_OFF);
+    if (show_details) {
+#if CONFIG_ADSB_WX_VIEW
+        if (s_view == VIEW_WX) set_view(VIEW_ADSB);
+#endif
+        lv_tabview_set_active(s_tabview, TAB_DETAILS, LV_ANIM_OFF);
+    }
 }
 
 static void update_topbar(void)
@@ -1952,8 +3027,27 @@ static void update_banner(void)
     if (board_screen_is_off()) board_screen_wake();   /* never hide an emergency */
 }
 
+static void apply_demo_request(void)
+{
+    if (!s_req_pending) return;
+    s_req_pending = false;
+    if (s_req_range > 0) {
+        settings_get()->range_nm = (uint16_t)s_req_range;
+        update_range_label();
+    }
+    if (s_req_select >= 0) select_aircraft((uint32_t)s_req_select, false);
+    if (s_req_tab >= 0 && s_req_tab < TAB_COUNT) lv_tabview_set_active(s_tabview, s_req_tab, LV_ANIM_OFF);
+    lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+    if (board_screen_is_off()) board_screen_wake();
+    take_snapshot();
+    update_list();
+    update_details();
+    lv_obj_invalidate(lv_screen_active());
+}
+
 static void refresh_timer_cb(lv_timer_t *tm)
 {
+    apply_demo_request();
     aircraft_tick();
     take_snapshot();
     update_topbar();
@@ -1962,9 +3056,15 @@ static void refresh_timer_cb(lv_timer_t *tm)
     lv_obj_invalidate(s_radar);
 
     uint32_t active = lv_tabview_get_tab_active(s_tabview);
-    if (active == 0) update_list();
-    if (active == 3) update_fw_section();
-    if (active == 1) update_details();
+    if (active == TAB_LIST) update_list();
+    if (active == TAB_SETTINGS) update_fw_section();
+    if (active == TAB_DETAILS) update_details();
+#if CONFIG_ADSB_WX_VIEW
+    update_weather(s_view == VIEW_WX);
+#else
+    update_weather(active == TAB_WEATHER);
+#endif
+    update_airband(false);   /* radar banner; the tab itself refreshes faster */
     update_stats();   /* also feeds the rate chart history */
     update_photo();
     poll_scan();
@@ -1976,6 +3076,7 @@ void ui_init(lv_display_t *disp)
 {
     s_snap = heap_caps_calloc(AC_MAX, sizeof(snap_t), MALLOC_CAP_SPIRAM);
     s_sel_copy = heap_caps_calloc(1, sizeof(aircraft_t), MALLOC_CAP_SPIRAM);
+    s_wx_view = heap_caps_calloc(1, sizeof(wx_state_t), MALLOC_CAP_SPIRAM);
     assert(s_snap && s_sel_copy);
 
     lv_theme_t *th = lv_theme_default_init(disp, COL_ACCENT, COL_SEL, true, &lv_font_montserrat_16);
@@ -1993,21 +3094,44 @@ void ui_init(lv_display_t *disp)
     lv_obj_set_size(s_tabview, SCR_W, PANEL_H);
     lv_tabview_set_tab_bar_size(s_tabview, 52);
     lv_obj_set_style_bg_color(s_tabview, COL_PANEL, 0);
-    lv_obj_t *t_list = lv_tabview_add_tab(s_tabview, LV_SYMBOL_LIST "  Aircraft");
-    lv_obj_t *t_det = lv_tabview_add_tab(s_tabview, LV_SYMBOL_EYE_OPEN "  Details");
-    lv_obj_t *t_stats = lv_tabview_add_tab(s_tabview, LV_SYMBOL_BARS "  Stats");
-    lv_obj_t *t_set = lv_tabview_add_tab(s_tabview, LV_SYMBOL_SETTINGS "  Settings");
+    lv_obj_t *t_list = lv_tabview_add_tab(s_tabview, LV_SYMBOL_LIST " Aircraft");
+    lv_obj_t *t_det = lv_tabview_add_tab(s_tabview, LV_SYMBOL_EYE_OPEN " Details");
+    lv_obj_t *t_wx = lv_tabview_add_tab(s_tabview, LV_SYMBOL_CHARGE " Weather");
+    lv_obj_t *t_ab = lv_tabview_add_tab(s_tabview, LV_SYMBOL_AUDIO " Airband");
+    lv_obj_t *t_stats = lv_tabview_add_tab(s_tabview, LV_SYMBOL_BARS " Stats");
+    lv_obj_t *t_set = lv_tabview_add_tab(s_tabview, LV_SYMBOL_SETTINGS " Settings");
     /* swiping between tabs fights with table scrolling; tabs are tapped instead */
     lv_obj_remove_flag(lv_tabview_get_content(s_tabview), LV_OBJ_FLAG_SCROLLABLE);
 
     build_list_tab(t_list);
     build_details_tab(t_det);
+#if CONFIG_ADSB_WX_VIEW
+    /* the weather lives in its own view; its tab is hidden (tab numbers stay the same) */
+    s_wx_panel = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_wx_panel);
+    lv_obj_set_pos(s_wx_panel, 0, PANEL_Y);
+    lv_obj_set_size(s_wx_panel, SCR_W, PANEL_H);
+    lv_obj_set_style_bg_color(s_wx_panel, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(s_wx_panel, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_wx_panel, LV_OBJ_FLAG_HIDDEN);
+    build_weather_tab(s_wx_panel);
+    lv_obj_add_flag(lv_obj_get_child(lv_tabview_get_tab_bar(s_tabview), TAB_WEATHER), LV_OBJ_FLAG_HIDDEN);
+    (void)t_wx;
+#else
+    build_weather_tab(t_wx);
+#endif
+    build_airband_tab(t_ab);
     build_stats_tab(t_stats);
     build_settings_tab(t_set);
     build_banner(scr);
 
     board_set_backlight(settings_get()->brightness);
     lv_timer_create(refresh_timer_cb, 1000, NULL);
+    lv_timer_create(airband_timer_cb, 200, NULL);
+#if CONFIG_ADSB_WX_VIEW
+    lv_timer_create(radar_timer_cb, 250, NULL);
+    set_view(VIEW_ADSB);
+#endif
     ota_report_ui_ready();
     ESP_LOGI(TAG, "UI ready");
 }

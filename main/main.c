@@ -7,16 +7,26 @@
  * looked up for each aircraft.
  */
 #include "adsb_client.h"
+#include "airband.h"
 #include "aircraft.h"
 #include "board.h"
+#include "crashlog.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lookup.h"
 #include "ota.h"
+#include "sdkconfig.h"
+#if CONFIG_ADSB_DEMO
+#include "demo.h"
+#endif
 #include "nvs_flash.h"
 #include "settings.h"
 #include "ui.h"
+#include "weather.h"
+#if CONFIG_ADSB_WX_VIEW
+#include "radar.h"
+#endif
 #include "wifi.h"
 
 static const char *TAG = "main";
@@ -37,6 +47,7 @@ static void lvgl_task(void *arg)
 
 void app_main(void)
 {
+    crashlog_init();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -47,6 +58,9 @@ void app_main(void)
     ota_init();
     ota_report_selftest(modes_selftest() == 0);
     settings_init();
+#if CONFIG_ADSB_DEMO
+    demo_prepare_settings();
+#endif
     aircraft_init();
 
     /* LVGL owns core 0's spare time; network work runs on core 1 */
@@ -54,7 +68,16 @@ void app_main(void)
 
     wifi_init();
     ota_start_server();
+#if CONFIG_ADSB_DEMO
+    demo_start();          /* simulated traffic instead of the feed and online lookups */
+#else
     adsb_client_start();
     lookup_start();
+    weather_start();       /* weather station feed (RF controller or rtl_433), if set */
+    airband_start();       /* GopherTrunk live audio, if a server is set */
+#if CONFIG_ADSB_WX_VIEW
+    radar_start();         /* RainViewer radar for the weather view */
+#endif
+#endif
     ESP_LOGI(TAG, "started");
 }

@@ -1,0 +1,3 @@
+# Demo build: simulated traffic around London Heathrow and GET /screenshot.bmp.
+# idf.py -B build_demo -D SDKCONFIG=build_demo/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.demo" build
+CONFIG_ADSB_DEMO=y
